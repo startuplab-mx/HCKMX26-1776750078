@@ -3,123 +3,117 @@ import json
 import cv2
 import numpy as np
 from ultralytics import YOLO
-import yt_dlp
 import requests
 import torch
 import os
 import urllib3
 
-# Desactivar advertencias de SSL para entornos de desarrollo
+# Desactivamos advertencias de SSL para que no ensucien la consola
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 class FiltroInteligencia:
     def __init__(self):
-        # Carga optimizada del modelo
-        self.model = YOLO("yolov8x-oiv7.pt")
-        self.model.to('cuda' if torch.cuda.is_available() else 'cpu')
-        
-        # Categorías de interés
-        self.categorias_criticas = ['Weapon', 'Rifle', 'Armored vehicle', 'Truck', 'Land vehicle', 'Van']
+        # ⚠️ VITAL: verbose=False evita que la IA imprima su progreso en consola y rompa el JSON
+        self.model = YOLO("yolov8x-oiv7.pt", verbose=False)
+        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        self.model.to(self.device)
 
-    def analizar_entorno(self, img):
-        """Detecta si la imagen corresponde a una zona rural/sierra"""
-        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-        bajo_sierra = np.array([10, 20, 20])
-        alto_sierra = np.array([30, 255, 200])
-        mask_sierra = cv2.inRange(hsv, bajo_sierra, alto_sierra)
-        return (cv2.countNonZero(mask_sierra) / (img.shape[0]*img.shape[1])) * 100
+        # Mapeo semántico de riesgos
+        self.categorias = {
+            "ARMAMENTO": ['weapon', 'gun', 'rifle', 'arm', 'shotgun', 'pistol', 'cannon', 'machine gun'],
+            "MOVILIDAD": ['vehicle', 'truck', 'car', 'tank', 'van', 'pickup', 'land vehicle', 'ambulance'],
+            "ESCENARIO": ['mountain', 'tree', 'forest', 'wood', 'plant', 'building', 'house', 'ruins', 'shack', 'wall', 'rock', 'cliff']
+        }
 
     def obtener_imagen(self, entrada):
-        headers = {'User-Agent': 'Mozilla/5.0'}
-        if os.path.exists(entrada): return cv2.imread(entrada)
-        
-        extensiones_img = ('.jpg', '.jpeg', '.png', '.webp', '.bmp')
-        if entrada.lower().split('?')[0].endswith(extensiones_img):
-            img_raw = requests.get(entrada, headers=headers, verify=False, timeout=5).content
-            return cv2.imdecode(np.frombuffer(img_raw, np.uint8), cv2.IMREAD_COLOR)
-        
-        ydl_opts = {'skip_download': True, 'quiet': True, 'no_warnings': True, 'extract_flat': True}
+        if os.path.exists(entrada):
+            return cv2.imread(entrada)
         try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(entrada, download=False)
-                img_url = info.get('thumbnail')
-                img_raw = requests.get(img_url, headers=headers, verify=False, timeout=5).content
-                return cv2.imdecode(np.frombuffer(img_raw, np.uint8), cv2.IMREAD_COLOR)
+            res = requests.get(entrada, verify=False, timeout=10)
+            if res.status_code == 200:
+                return cv2.imdecode(np.frombuffer(res.content, np.uint8), cv2.IMREAD_COLOR)
+            return None
         except:
             return None
 
-    def ejecutar_analisis(self, entrada):
-        """Lógica principal que retorna datos estructurados para Node.js"""
-        img = self.obtener_imagen(entrada)
-        if img is None:
-            raise ValueError(f"No se pudo cargar la imagen desde la fuente")
-
-        arma_detectada = False
-        vehiculo_detectado = False
+    def triage(self, img):
+        # ⚠️ VITAL: verbose=False en la inferencia
+        resultados = self.model(img, verbose=False)
         
-        # Inferencia rápida
-        results = self.model.predict(img, conf=0.15, verbose=False, imgsz=640)
+        riesgos_detectados = {}
+        conteo_categorias = 0
 
-        for r in results:
-            for box in r.boxes:
-                label = self.model.names[int(box.cls)]
-                if label in ['Weapon', 'Rifle']: arma_detectada = True
-                if label in ['Armored vehicle', 'Truck', 'Land vehicle', 'Van']: vehiculo_detectado = True
+        for r in resultados:
+            cajas = r.boxes
+            for caja in cajas:
+                clase_id = int(caja.cls[0])
+                nombre_clase = self.model.names[clase_id].lower()
 
-        # Análisis de entorno
-        sierra_perc = self.analizar_entorno(img)
-        es_sierra = sierra_perc > 15
+                # Clasificar el objeto detectado
+                for categoria, palabras_clave in self.categorias.items():
+                    if any(pc in nombre_clase for pc in palabras_clave):
+                        if categoria not in riesgos_detectados:
+                            riesgos_detectados[categoria] = set()
+                            conteo_categorias += 1
+                        riesgos_detectados[categoria].add(nombre_clase)
+        
+        return riesgos_detectados, conteo_categorias
 
-        # Conteo de factores de riesgo
-        factores = 0
-        if arma_detectada: factores += 1
-        if vehiculo_detectado: factores += 1
-        if es_sierra: factores += 1
-
-        # Determinación de niveles según tus parámetros
-        amenaza_detectada = factores > 0
-        if factores >= 2:
-            nivel = "alto"
-        elif factores == 1:
-            nivel = "medio"
-        else:
-            nivel = "nulo"
-
-        return amenaza_detectada, nivel
-
-def main():
+if __name__ == "__main__":
     try:
-        # 1. Recibir el JSON enviado desde Node.js por argumentos de sistema
+        # 1. Leer el JSON enviado por Node.js a través de los argumentos del sistema
         if len(sys.argv) < 2:
-            raise ValueError("No se recibió el JSON de entrada")
+            raise ValueError("No se recibio el JSON de entrada desde Node.js")
 
         input_json = sys.argv[1]
         data = json.loads(input_json)
         cover_url = data.get("image_source")
 
         if not cover_url:
-            raise ValueError("El JSON no contiene 'image_source'")
+            raise ValueError("El JSON no contiene el campo 'image_source'")
 
-        # 2. Instanciar y ejecutar
-        filtro = FiltroInteligencia()
-        es_amenaza, nivel_amenaza = filtro.ejecutar_analisis(cover_url)
+        # 2. Inicializar el modelo
+        app = FiltroInteligencia()
 
-        # 3. Preparar la respuesta JSON para Node.js
-        decision = "amenaza" if es_amenaza else "seguro"
-        
-        # IMPORTANTE: Esto es lo único que el script debe imprimir en consola
-        print(json.dumps({
+        # 3. Obtener la imagen
+        img = app.obtener_imagen(cover_url)
+        if img is None:
+            raise ValueError(f"No se pudo descargar o procesar la imagen: {cover_url}")
+
+        # 4. Ejecutar el análisis (Triage)
+        riesgos_detectados, conteo_riesgos = app.triage(img)
+
+        # 5. Lógica de Decisión estricta para Node.js
+        if conteo_riesgos >= 2:
+            nivel_amenaza = "alto"
+            decision = "amenaza"
+        elif conteo_riesgos == 1:
+            nivel_amenaza = "medio"
+            decision = "amenaza"
+        else:
+            nivel_amenaza = "nulo"
+            decision = "seguro"
+
+        # 6. Imprimir ÚNICAMENTE el JSON de respuesta
+        # Convertimos los conjuntos (sets) a listas para que el JSON sea válido
+        detalles_riesgos = {k: list(v) for k, v in riesgos_detectados.items()}
+
+        respuesta = {
+            "status": "success",
             "decision": decision,
             "nivel": nivel_amenaza,
-            "status": "success"
-        }))
+            "detalles": detalles_riesgos
+        }
+        
+        # El ÚNICO print del sistema
+        print(json.dumps(respuesta))
 
     except Exception as e:
-        # Enviar el error a Node.js en formato JSON
-        print(json.dumps({
+        # Respuesta de error en formato JSON
+        error_resp = {
             "status": "error",
-            "message": str(e)
-        }))
-
-if __name__ == "__main__":
-    main()
+            "message": str(e),
+            "decision": "desconocido",
+            "nivel": "desconocido"
+        }
+        print(json.dumps(error_resp))
